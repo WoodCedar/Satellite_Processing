@@ -1,0 +1,141 @@
+'''
+Author: zhanghb
+Email:zhb1227@126.com
+Function: Crop the GF1, 2, 6, 7 images in the folder, and then calculate ndwi according to the region, and then get the 01 value map of the regional water body.
+Region: yinma River
+Release Date：2023-8-3
+Release Version: V1.0, integrate three scripts.
+Update Description:
+'''
+import os
+import geopandas as gpd
+import rasterio
+from rasterio.mask import mask
+from shapely.geometry import mapping
+import numpy as np
+from rasterio.transform import Affine
+from skimage.filters import threshold_multiotsu
+from rasterio.features import shapes
+from scipy.ndimage import binary_opening, binary_closing
+from skimage.morphology import disk
+
+# Define a nodata value that is unlikely to appear in the raster data
+nodata_value = -9999
+
+def clip_rasters(input_folder: str, output_folder: str, shp_file: str) -> list:
+    gdf = gpd.read_file(shp_file)
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    clipped_rasters = []
+    for file in os.listdir(input_folder):
+        if file.endswith('.tiff'):
+            input_raster_path = os.path.join(input_folder, file)
+            with rasterio.open(input_raster_path) as src:
+                out_image, out_transform = mask(src, [mapping(gdf.geometry[0])], crop=True, nodata=nodata_value)
+                out_meta = src.meta.copy()
+
+            out_meta.update({
+                "driver": "GTiff",
+                "height": out_image.shape[1],
+                "width": out_image.shape[2],
+                "transform": out_transform,
+                "nodata": np.uint16(65535)
+            })
+
+            out_image = out_image.astype(np.float32)
+            out_image[out_image == nodata_value] = np.nan
+
+            output_raster_path = os.path.join(output_folder, os.path.splitext(file)[0] + '_cut.tif')
+            with rasterio.open(output_raster_path, 'w', **out_meta) as dest:
+                dest.write(out_image.astype(rasterio.float32))
+
+            clipped_rasters.append(output_raster_path)
+            print(f"Clipped raster saved as: {output_raster_path}")
+
+    return clipped_rasters
+
+def calculate_ndwi(input_folder: str, output_folder: str) -> list:
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    ndwi_files = []
+    for file in os.listdir(input_folder):
+        if file.endswith('.tif'):
+            gf2_image_filepath = os.path.join(input_folder, file)
+            with rasterio.open(gf2_image_filepath) as src:
+                green_band = src.read(2)
+                nir_band = src.read(4)
+                profile = src.profile
+
+            epsilon = 1e-8
+            ndwi = (green_band.astype(float) - nir_band.astype(float)) / (green_band.astype(float) + nir_band.astype(float) + epsilon)
+            output_filename_ndwi = os.path.join(output_folder, os.path.splitext(file)[0] + "_NDWI.tif")
+
+            index_profile = profile.copy()
+            index_profile.update(dtype=rasterio.float32, count=1)
+
+            with rasterio.open(output_filename_ndwi, 'w', **index_profile) as dst:
+                dst.write(ndwi.astype(rasterio.float32), 1)
+
+            ndwi_files.append(output_filename_ndwi)
+            print(f"Generated file: {output_filename_ndwi}")
+
+    return ndwi_files
+
+def classify_images(input_folder: str, output_directory: str) -> list:
+    os.makedirs(output_directory, exist_ok=True)
+
+    classified_files = []
+    for file in os.listdir(input_folder):
+        if file.endswith('.tif'):
+            input_tif = os.path.join(input_folder, file)
+            with rasterio.open(input_tif) as src:
+                data = src.read().astype(np.float32) 
+                profile = src.profile
+
+            data[data == -9999] = np.nan
+            scaled_data = np.empty_like(data, dtype=np.uint8)
+            for i in range(data.shape[0]):
+                scaled_data[i] = ((data[i] - np.nanmin(data[i])) / (np.nanmax(data[i]) - np.nanmin(data[i])) * 255).astype(np.uint8)
+
+            thresholds = [threshold_multiotsu(band,nbins=256)[-1] for band in scaled_data]
+            output_txt = os.path.join(output_directory, 'thresholds2.txt')
+            with open(output_txt, 'w') as txt_file:
+                txt_file.write(f'NDWI Threshold: {thresholds[0]}\n')
+
+            classification = np.full_like(scaled_data[0], 0, dtype=np.uint8)  
+            classification[(scaled_data[0] > thresholds[0])] = 1  
+            classification[np.isnan(data[0])] = 255  
+
+            output_tif = os.path.join(output_directory, os.path.splitext(file)[0] + '_classified.tif')
+            profile.update(dtype=rasterio.uint8, count=1, nodata=255) 
+
+            with rasterio.open(output_tif, 'w', **profile) as dst:
+                dst.write(classification, 1)
+
+            classified_files.append(output_tif)
+            print(f"Generated file: {output_tif}")
+
+    return classified_files
+
+def main():
+    input_folder = r"folder"  # Replace with your input folder path
+    output_folder = r"folder"  # Replace with your output folder path
+    shp_file = r"shp file pathp" # Replace with your shp file path
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        
+    clipped_folder = os.path.join(output_folder, "clipped")
+    clipped_rasters = clip_rasters(input_folder, clipped_folder, shp_file)
+
+    ndwi_folder = os.path.join(output_folder, "ndwi")
+    ndwi_files = calculate_ndwi(clipped_folder, ndwi_folder)
+
+    classified_folder = os.path.join(output_folder, "classified")
+    classified_files = classify_images(ndwi_folder, classified_folder)
+
+    print("All operations completed successfully.")
+
+if __name__ == "__main__":
+    main()
